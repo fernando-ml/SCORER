@@ -664,7 +664,7 @@ def set_environment_defaults(config, env_name):
             "LEADER_UPDATE_INTERVAL": 10,
             "FOLLOWER_UPDATE_INTERVAL": 10,
             "LATENT_DIM": 64,
-            "PERCEPTION_LR": 2e-4,  # Follower learns faster to converge to best response
+            "PERCEPTION_LR": 3e-4,  # Follower learns faster to converge to best response
         })
 
     if "TOTAL_TIMESTEPS" not in config:

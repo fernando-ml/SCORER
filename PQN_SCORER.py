@@ -499,9 +499,7 @@ def run_single_seed(config, seed):
     if config["USE_MSBE"]:
         loss_components.append("MSBE")
     if config["USE_BE_VARIANCE"]:
-        loss_components.append("TDVar")
-    if config["USE_NORM_LOSS"]:
-        loss_components.append("Norm")
+        loss_components.append("BEVar")
     loss_str = '+'.join(loss_components) if loss_components else "MSBE"
 
     filename_prefix = f"SCORER_PQN_{config['ENV_NAME']}_{loss_str}_{seed}"
@@ -554,9 +552,7 @@ def process_results(config, outs, seed_values):
     if config["USE_MSBE"]:
         loss_components.append("MSBE")
     if config["USE_BE_VARIANCE"]:
-        loss_components.append("TDVar")
-    if config["USE_NORM_LOSS"]:
-        loss_components.append("Norm")
+        loss_components.append("BEVar")
     loss_str = '+'.join(loss_components) if loss_components else "MSBE"
 
     filename_prefix = f"SCORER_PQN/{config['ENV_NAME']}_{loss_str}_{config['SEED']}"
@@ -599,10 +595,10 @@ def set_environment_defaults(config, env_name):
 
     if is_minatar:
         config.update({
-            "NUM_ENVS": 128,
+            "NUM_ENVS": 32,
             "NUM_STEPS": 64,
             "NUM_MINIBATCHES": 8,
-            "NUM_EPOCHS": 4,
+            "NUM_EPOCHS": 2,
             "EPS_START": 1.0,
             "EPS_FINISH": 0.01,
             "EPS_DECAY": 0.8,
@@ -624,7 +620,7 @@ def set_environment_defaults(config, env_name):
             "NUM_ENVS": 10,
             "NUM_STEPS": 128,
             "NUM_MINIBATCHES": 4,
-            "NUM_EPOCHS": 4,
+            "NUM_EPOCHS": 2,
             "EPS_START": 1.0,
             "EPS_FINISH": 0.05,
             "EPS_DECAY": 0.5,
