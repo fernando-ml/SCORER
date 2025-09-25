@@ -193,12 +193,12 @@ def make_train(config):
 
             perception_tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(learning_rate=perception_lr)
+                optax.radam(learning_rate=perception_lr)
             )
 
             q_tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(learning_rate=lr)
+                optax.radam(learning_rate=lr)
             )
 
             perception_state = PerceptionTrainState.create(
@@ -595,24 +595,24 @@ def set_environment_defaults(config, env_name):
 
     if is_minatar:
         config.update({
-            "NUM_ENVS": 32,
-            "NUM_STEPS": 64,
-            "NUM_MINIBATCHES": 8,
-            "NUM_EPOCHS": 2,
+            "NUM_ENVS": 128,
+            "NUM_STEPS": 32,
+            "NUM_MINIBATCHES": 32,
+            "NUM_EPOCHS": 4,
             "EPS_START": 1.0,
             "EPS_FINISH": 0.01,
             "EPS_DECAY": 0.8,
-            "LR": 1e-4,
+            "LR": 2.5e-4,
             "PERCEPTION_LR": 5e-4,
-            "LAMBDA": 0.95,
-            "MAX_GRAD_NORM": 0.5,
+            "LAMBDA": 0.65,
+            "MAX_GRAD_NORM": 5.0,
             "LATENT_DIM": 128,
             "Q_HIDDEN_SIZE": 64,
             "Q_NUM_LAYERS": 1,
             "NORM_TYPE": "layer_norm",
             "NORM_INPUT": False,
             "REW_SCALE": 1,
-            "TOTAL_TIMESTEPS_DECAY": 1e7,
+            "TOTAL_TIMESTEPS_DECAY": 5e7,
             "LR_LINEAR_DECAY": True,
         })
     else:
