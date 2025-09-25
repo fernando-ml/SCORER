@@ -11,12 +11,8 @@ def parse_args():
                         help="Base random seed (default: 8)")
     parser.add_argument("--total_timesteps", type=float, default=1e6,
                         help="Total timesteps for training (default: 1e6)")
-    parser.add_argument("--USE_VARIANCE_LOSS", action="store_true",
+    parser.add_argument("--use_be_variance", action="store_true",
                         help="Use Variance in perception loss")
-    parser.add_argument("--use_norm_loss", action="store_true",
-                        help="Use representation norm loss in perception loss")
-    parser.add_argument("--coef_representation_norm", type=float, default=0.1,
-                        help="Coefficient for representation norm loss")
     return parser.parse_args()
 
 import time
@@ -56,7 +52,7 @@ class PerceptionNetwork(nn.Module):
             normalize = lambda x: x
 
         x = nn.Dense(self.latent_dim)(x)
-        # x = normalize(x)
+        x = normalize(x)
         x = nn.relu(x)
         x = normalize(x)
         return x
@@ -150,7 +146,6 @@ def make_train(config):
             (config["EPS_DECAY"]) * config["NUM_UPDATES_DECAY"],
         )
 
-        # Different learning rates for perception and Q-network (key SCORER insight)
         lr_scheduler = optax.linear_schedule(
             init_value=config["LR"],
             end_value=1e-20,
@@ -196,15 +191,14 @@ def make_train(config):
             )
             perception_lr = perception_lr_scheduler if config.get("LR_LINEAR_DECAY", False) else config["PERCEPTION_LR"]
 
-            # Then change the perception optimizer to:
             perception_tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.radam(learning_rate=perception_lr)  # Now uses scheduled LR
+                optax.adam(learning_rate=perception_lr)
             )
 
             q_tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.radam(learning_rate=lr)  # Standard LR
+                optax.adam(learning_rate=lr)
             )
 
             perception_state = PerceptionTrainState.create(
@@ -229,7 +223,6 @@ def make_train(config):
         def _update_step(runner_state, unused):
             perception_state, action_state, expl_state, timesteps, n_updates, rng = runner_state
 
-            # COLLECT TRAJECTORIES (like PQN)
             def _step_env(carry, _):
                 last_obs, env_state, current_timesteps, rng = carry
                 rng, rng_a, rng_s = jax.random.split(rng, 3)
@@ -263,7 +256,7 @@ def make_train(config):
                     reward=config.get("REW_SCALE", 1) * reward,
                     done=new_done,
                     next_obs=new_obs,
-                    q_val=q_vals,  # Store Q-values from data collection (like PQN)
+                    q_val=q_vals,
                 )
                 return (new_obs, new_env_state, current_timesteps, rng), (transition, info, current_timesteps)
 
@@ -276,8 +269,6 @@ def make_train(config):
             )
             expl_state = tuple(expl_state)
 
-            # COMPUTE LAMBDA RETURNS (like PQN, using collected q_vals)
-            # Encode last observation for bootstrap value
             last_encoded = perception_network.apply(
                 {"params": perception_state.params, "batch_stats": perception_state.batch_stats},
                 transitions.next_obs[-1],
@@ -302,7 +293,7 @@ def make_train(config):
                 lambda_returns = (
                     1 - transition.done
                 ) * lambda_returns + transition.done * transition.reward
-                # Use Q-values from data collection (like PQN)
+
                 next_q = jnp.max(transition.q_val, axis=-1)
                 return (lambda_returns, next_q), lambda_returns
 
@@ -390,30 +381,24 @@ def make_train(config):
                         # Perception loss options (SCORER variants)
                         msbe = jnp.mean(jnp.square(td_errors))
                         td_mean = jnp.mean(td_errors)
-                        variance_loss = jnp.mean(jnp.square(td_errors - td_mean))
-                        representation_norm = jnp.mean(jnp.square(encoded_state_new))
-                        target_norm = 1.0
-                        norm_loss = config["COEF_REPRESENTATION_NORM"] * jnp.square(target_norm - representation_norm)
+                        be_variance = jnp.mean(jnp.square(td_errors - td_mean))
 
                         # Default to MSBE
-                        loss = msbe * (1.0 - config["USE_VARIANCE_LOSS"]) * (1.0 - config["USE_NORM_LOSS"])
+                        loss = msbe * (1.0 - config["USE_BE_VARIANCE"])
 
-                        if config["USE_VARIANCE_LOSS"]:
-                            loss = loss + variance_loss
+                        if config["USE_BE_VARIANCE"]:
+                            loss = loss + be_variance
 
-                        if config["USE_NORM_LOSS"]:
-                            loss = loss + norm_loss
+                        return loss, (updates, be_variance, msbe)
 
-                        return loss, (updates, variance_loss, representation_norm, msbe)
-
-                    (p_loss, (p_updates, td_var, rep_norm, msbe)), p_grads = jax.value_and_grad(
+                    (p_loss, (p_updates, be_var, msbe)), p_grads = jax.value_and_grad(
                         perception_loss_fn, has_aux=True
                     )(perception_state.params)
 
                     perception_state = perception_state.apply_gradients(grads=p_grads)
                     perception_state = perception_state.replace(batch_stats=p_updates["batch_stats"])
 
-                    return (perception_state, action_state, rng), (q_loss, p_loss, qvals, td_var, rep_norm, msbe)
+                    return (perception_state, action_state, rng), (q_loss, p_loss, qvals, be_var, msbe)
 
                 def preprocess_transition(x, rng):
                     x = x.reshape(-1, *x.shape[2:])
@@ -430,15 +415,15 @@ def make_train(config):
                 )
 
                 rng, _rng = jax.random.split(rng)
-                (perception_state, action_state, rng), (q_loss, p_loss, qvals, td_var, rep_norm, msbe) = jax.lax.scan(
+                (perception_state, action_state, rng), (q_loss, p_loss, qvals, be_var, msbe) = jax.lax.scan(
                     _learn_phase, (perception_state, action_state, rng), (minibatches, targets)
                 )
 
-                return (perception_state, action_state, rng), (q_loss, p_loss, qvals, td_var, rep_norm, msbe)
+                return (perception_state, action_state, rng), (q_loss, p_loss, qvals, be_var, msbe)
 
             # Run learning epochs
             rng, _rng = jax.random.split(rng)
-            (perception_state, action_state, rng), (q_loss, p_loss, qvals, td_var, rep_norm, msbe) = jax.lax.scan(
+            (perception_state, action_state, rng), (q_loss, p_loss, qvals, be_var, msbe) = jax.lax.scan(
                 _learn_epoch, (perception_state, action_state, rng), None, config["NUM_EPOCHS"]
             )
 
@@ -454,8 +439,7 @@ def make_train(config):
                 "q_loss": q_loss.mean(),
                 "perception_loss": p_loss.mean(),
                 "qvals": qvals.mean(),
-                "variance_loss": td_var.mean(),
-                "representation_norm": rep_norm.mean(),
+                "be_variance": be_var.mean(),
                 "msbe": msbe.mean(),
             }
             metrics.update({k: v.mean() for k, v in infos.items()})
@@ -514,7 +498,7 @@ def run_single_seed(config, seed):
     loss_components = []
     if config["USE_MSBE"]:
         loss_components.append("MSBE")
-    if config["USE_VARIANCE_LOSS"]:
+    if config["USE_BE_VARIANCE"]:
         loss_components.append("TDVar")
     if config["USE_NORM_LOSS"]:
         loss_components.append("Norm")
@@ -569,7 +553,7 @@ def process_results(config, outs, seed_values):
     loss_components = []
     if config["USE_MSBE"]:
         loss_components.append("MSBE")
-    if config["USE_VARIANCE_LOSS"]:
+    if config["USE_BE_VARIANCE"]:
         loss_components.append("TDVar")
     if config["USE_NORM_LOSS"]:
         loss_components.append("Norm")
@@ -645,7 +629,7 @@ def set_environment_defaults(config, env_name):
             "EPS_FINISH": 0.05,
             "EPS_DECAY": 0.5,
             "LR": 1e-4,
-            "PERCEPTION_LR": 3e-4,
+            "PERCEPTION_LR": 5e-4,
             "LAMBDA": 0.95,
             "MAX_GRAD_NORM": 0.5,
             "LATENT_DIM": 64,
@@ -675,10 +659,8 @@ if __name__ == "__main__":
         "SEED": args.seed,
         "WANDB_MODE": "online" if args.num_seeds == 1 else "disabled",
         "PROJECT": "SCORER_PQN",
-        "USE_MSBE": not (args.USE_VARIANCE_LOSS or args.use_norm_loss),
-        "USE_VARIANCE_LOSS": args.USE_VARIANCE_LOSS,
-        "USE_NORM_LOSS": args.use_norm_loss,
-        "COEF_REPRESENTATION_NORM": args.coef_representation_norm,
+        "USE_MSBE": not (args.use_be_variance),
+        "USE_BE_VARIANCE": args.use_be_variance,
     }
 
     config = set_environment_defaults(config, args.env)

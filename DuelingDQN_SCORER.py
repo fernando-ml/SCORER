@@ -11,12 +11,8 @@ def parse_args():
                         help="Base random seed (default: 8)")
     parser.add_argument("--total_timesteps", type=float, default=1e8,
                         help="Total timesteps for training (default: 1e6)")
-    parser.add_argument("--use_td_variance", action="store_true",
-                        help="Use TD variance in perception loss")
-    parser.add_argument("--use_norm_loss", action="store_true",
-                        help="Use representation norm loss in perception loss")
-    parser.add_argument("--coef_representation_norm", type=float, default=0.1,
-                        help="Coefficient for representation norm loss")
+    parser.add_argument("--use_be_variance", action="store_true",
+                        help="Use BE variance in perception loss")
     parser.add_argument("--follower_convergence_steps", type=int, default=1,
                         help="Number of gradient steps for follower to converge to best response")
     parser.add_argument("--activation", type=str, default="relu",
@@ -204,10 +200,10 @@ def make_train(config):
             if config.get("PERCEPTION_MAX_GRAD_NORM", 0) > 0:
                 return optax.chain(
                     optax.clip_by_global_norm(config["PERCEPTION_MAX_GRAD_NORM"]),
-                    optax.adam(learning_rate=perception_lr)  # Now uses scheduled LR
+                    optax.adam(learning_rate=perception_lr)
                 )
             else:
-                return optax.adam(learning_rate=perception_lr)  # Now uses scheduled LR
+                return optax.adam(learning_rate=perception_lr)
 
         def create_q_tx():
             transforms = []
@@ -327,9 +323,6 @@ def make_train(config):
                 return action_state, q_loss, q_metrics
 
             def _learn_follower(perception_state, action_state, rng):
-                """Follower (Perception) computes best response to leader's strategy"""
-
-                # Follower performs multiple gradient steps to converge to best response
                 def follower_step(carry, _):
                     perception_state, rng = carry
                     rng, rng_sample = jax.random.split(rng)
@@ -372,23 +365,16 @@ def make_train(config):
                         # All loss components
                         msbe = jnp.mean(jnp.square(td_errors))
                         td_mean = jnp.mean(td_errors)
-                        td_variance = jnp.mean(jnp.square(td_errors - td_mean))
-                        representation_norm = jnp.mean(jnp.square(encoded_state_new))
-                        target_norm = 1.0
-                        norm_loss = config["COEF_REPRESENTATION_NORM"] * jnp.square(target_norm - representation_norm)
+                        be_variance = jnp.mean(jnp.square(td_errors - td_mean))
 
                         # MSBE as fallback
-                        loss = msbe * (1.0 - config["USE_TD_VARIANCE"]) * (1.0 - config["USE_NORM_LOSS"])
+                        loss = msbe * (1.0 - config["USE_BE_VARIANCE"])
 
-                        if config["USE_TD_VARIANCE"]:
-                            loss = loss + td_variance
-
-                        if config["USE_NORM_LOSS"]:
-                            loss = loss + norm_loss
+                        if config["USE_BE_VARIANCE"]:
+                            loss = loss + be_variance
 
                         return loss, {
-                            "td_variance": td_variance,
-                            "representation_norm": representation_norm,
+                            "be_variance": be_variance,
                             "msbe": msbe
                         }
 
@@ -400,7 +386,6 @@ def make_train(config):
 
                     return (perception_state, rng), perception_metrics
 
-                # Perform multiple gradient steps to approach best response
                 (perception_state, _), perception_metrics = jax.lax.scan(
                     follower_step,
                     (perception_state, rng),
@@ -408,7 +393,6 @@ def make_train(config):
                     config["FOLLOWER_CONVERGENCE_STEPS"]
                 )
 
-                # Return the last metrics from convergence
                 perception_metrics = jax.tree.map(lambda x: x[-1], perception_metrics)
 
                 return perception_state, perception_metrics
@@ -419,7 +403,7 @@ def make_train(config):
             # Check if buffer can sample
             can_learn = buffer.can_sample(buffer_state) & (timesteps > config["LEARNING_STARTS"])
 
-            # STEP 1: Leader (Q-network) update - less frequent
+            # STEP 1: Leader (Q-network) update
             is_leader_update_time = can_learn & (timesteps % config["LEADER_UPDATE_INTERVAL"] == 0)
 
             def do_leader_update():
@@ -436,15 +420,14 @@ def make_train(config):
                 lambda: skip_leader_update()
             )
 
-            # STEP 2: Follower (Perception) best response - more frequent
+            # STEP 2: Follower (Perception) best response
             is_follower_update_time = can_learn & (timesteps % config["FOLLOWER_UPDATE_INTERVAL"] == 0)
 
             def do_follower_update():
                 return _learn_follower(perception_state, action_state, rng_follower)
 
             def skip_follower_update():
-                return perception_state, {"td_variance": jnp.array(0.0),
-                                         "representation_norm": jnp.array(0.0),
+                return perception_state, {"be_variance": jnp.array(0.0),
                                          "msbe": jnp.array(0.0)}
 
             perception_state, perception_metrics = jax.lax.cond(
@@ -570,10 +553,8 @@ def run_single_seed(config, seed):
     loss_components = []
     if config["USE_MSBE"]:
         loss_components.append("MSBE")
-    if config["USE_TD_VARIANCE"]:
-        loss_components.append("TDVar")
-    if config["USE_NORM_LOSS"]:
-        loss_components.append("Norm")
+    if config["USE_BE_VARIANCE"]:
+        loss_components.append("BEVar")
     loss_str = '+'.join(loss_components) if loss_components else "MSBE"
 
     filename_prefix = f"SCORER_DuelingDQN_{config['ENV_NAME']}_{loss_str}_{seed}"
@@ -613,10 +594,8 @@ def process_results(config, outs, seed_values):
     loss_components = []
     if config["USE_MSBE"]:
         loss_components.append("MSBE")
-    if config["USE_TD_VARIANCE"]:
-        loss_components.append("TDVar")
-    if config["USE_NORM_LOSS"]:
-        loss_components.append("Norm")
+    if config["USE_BE_VARIANCE"]:
+        loss_components.append("BEVar")
     loss_str = '+'.join(loss_components) if loss_components else "MSBE"
 
     filename_prefix = f"DuelingDQN/{config['ENV_NAME']}_{loss_str}_{config['SEED']}"
@@ -668,9 +647,10 @@ def set_environment_defaults(config, env_name):
             "TARGET_UPDATE_INTERVAL": 1e3,
             "LR": 1e-4,
             "LEARNING_STARTS": 1e4,
-            "TRAINING_INTERVAL": 4,  # This is now FOLLOWER_UPDATE_INTERVAL
+            "LEADER_UPDATE_INTERVAL": 4,
+            "FOLLOWER_UPDATE_INTERVAL": 4,
             "LATENT_DIM": 128,
-            "PERCEPTION_LR": 3e-4,  # Follower learns faster to converge to best response
+            "PERCEPTION_LR": 5e-4,  # Follower learns faster to converge to best response
         })
     else:
         # Control environments defaults
@@ -684,7 +664,8 @@ def set_environment_defaults(config, env_name):
             "TARGET_UPDATE_INTERVAL": 1000,
             "LR": 3e-4,
             "LEARNING_STARTS": 1000,
-            "TRAINING_INTERVAL": 10,  # This is now FOLLOWER_UPDATE_INTERVAL
+            "LEADER_UPDATE_INTERVAL": 10,
+            "FOLLOWER_UPDATE_INTERVAL": 10,
             "LATENT_DIM": 64,
             "PERCEPTION_LR": 6e-4,  # Follower learns faster to converge to best response
         })
@@ -696,7 +677,6 @@ def set_environment_defaults(config, env_name):
 
 if __name__ == "__main__":
     args = parse_args()
-    # os.environ["CUDA_VISIBLE_DEVICES"] = "0" if "minatar" not in args.env.lower() else "1"
 
     config = {
         "NUM_SEEDS": args.num_seeds,
@@ -711,19 +691,15 @@ if __name__ == "__main__":
         "PROJECT": "SCORER_DuelingDQN",
         "MAX_GRAD_NORM": 0.5,
         "PERCEPTION_MAX_GRAD_NORM": 0.5,
-        "LEADER_UPDATE_INTERVAL": 10,  # Q-network (leader) updates less frequently
-        "FOLLOWER_UPDATE_INTERVAL": 10,  # Perception (follower) updates more frequently
-        "FOLLOWER_CONVERGENCE_STEPS": args.follower_convergence_steps,  # Steps for follower to converge
+        "LEADER_UPDATE_INTERVAL": 4,
+        "FOLLOWER_UPDATE_INTERVAL": 4,
+        "FOLLOWER_CONVERGENCE_STEPS": args.follower_convergence_steps,  # Steps for follower to converge. following TTSA we stick to 1 step
         "LR_LINEAR_DECAY": True,
-        "USE_MSBE": not (args.use_td_variance or args.use_norm_loss),  # Default to MSBE if no other loss specified
-        "USE_TD_VARIANCE": args.use_td_variance,
-        "USE_NORM_LOSS": args.use_norm_loss,
-        "COEF_REPRESENTATION_NORM": args.coef_representation_norm,
+        "USE_MSBE": not (args.use_be_variance),  # Default to MSBE if no other loss specified
+        "USE_BE_VARIANCE": args.use_be_variance,
     }
 
     config = set_environment_defaults(config, args.env)
-
-    # print("Available devices:", jax.devices())
 
     if config["NUM_SEEDS"] == 1:
         print("Running single seed training...")

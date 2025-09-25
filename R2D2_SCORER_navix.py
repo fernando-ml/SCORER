@@ -3,16 +3,12 @@ import argparse
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train R2D2 agent with SCORER")
-    parser.add_argument("--env", type=str, default="Navix-DoorKey-8x8-v0")
+    parser.add_argument("--env", type=str, default="Navix-DoorKey-6x6-v0")
     parser.add_argument("--num_seeds", type=int, default=30)
     parser.add_argument("--seed", type=int, default=8)
     parser.add_argument("--total_timesteps", type=float, default=1e6)
-    parser.add_argument("--use_td_variance", action="store_true",
-                        help="Use TD variance in leader loss")
-    parser.add_argument("--use_norm_loss", action="store_true",
-                        help="Use representation norm loss in leader loss")
-    parser.add_argument("--coef_representation_norm", type=float, default=0.1,
-                        help="Coefficient for representation norm loss")
+    parser.add_argument("--use_be_variance", action="store_true",
+                        help="Use BE variance in leader loss")
     parser.add_argument("--control_convergence_steps", type=int, default=1,
                         help="Number of gradient steps for control network (leader) to update (default: 1)")
     return parser.parse_args()
@@ -41,7 +37,6 @@ class PerceptionRecurrentNetwork(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, hidden: jnp.ndarray):
-        # Handle different input dimensions robustly
         original_shape = x.shape
 
         if x.ndim == 1:
@@ -91,7 +86,7 @@ class ControlNetwork(nn.Module):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray):
-        # Takes representation from perception network, no hidden state needed
+        # Takes representation from perception network
         # x = L1Norm()(x)
         x = nn.Dense(128, kernel_init=nn.initializers.orthogonal(np.sqrt(2)))(x)
         x = nn.tanh(x)
@@ -168,14 +163,14 @@ def make_train(config):
         _timestep = TimeStep(obs=_obs, action=_action, reward=_reward, done=_done, truncated=jnp.array(False), hidden=_hidden)
         buffer_state = buffer.init(_timestep)
 
-        # Initialize perception network (Follower in SCORER)
+        # Initialize perception network
         perception_network = PerceptionRecurrentNetwork(hidden_dim=config["HIDDEN_DIM"])
         rng, _rng = jax.random.split(rng)
         dummy_obs = jnp.zeros((obs_dim,))
         dummy_hidden = jnp.zeros((config["HIDDEN_DIM"],))
         perception_params = perception_network.init(_rng, dummy_obs, dummy_hidden)
 
-        # Initialize control network (Leader in SCORER)
+        # Initialize control network
         control_network = ControlNetwork(action_dim=env.action_space(env_params).n)
         rng, _rng = jax.random.split(rng)
         dummy_representation, _ = perception_network.apply(perception_params, dummy_obs, dummy_hidden)
@@ -195,12 +190,12 @@ def make_train(config):
         # Separate optimizers for perception (follower) and control (leader)
         perception_tx = optax.chain(
             optax.clip_by_global_norm(config.get("PERCEPTION_MAX_GRAD_NORM", 0.5)),
-            optax.adam(learning_rate=perception_lr)  # Now uses scheduled LR
+            optax.adam(learning_rate=perception_lr)
         )
 
         control_tx = optax.chain(
             optax.clip_by_global_norm(0.5),
-            optax.adam(learning_rate=lr)  # Still uses scheduled LR
+            optax.adam(learning_rate=lr)
         )
 
         perception_state = PerceptionTrainState.create(
@@ -253,9 +248,8 @@ def make_train(config):
 
             rng, rng_a, rng_s = jax.random.split(rng, 3)
 
-            # Forward pass with perception network
             representation, new_hidden = perception_network.apply(perception_state.params, last_obs, hidden_states)
-            # Get Q-values from control network
+
             q_vals = control_network.apply(control_state.params, representation)
             action = eps_greedy_exploration(rng_a, q_vals, perception_state.timesteps)
 
@@ -307,7 +301,7 @@ def make_train(config):
                 # Check if it's time for control network update
                 is_control_update_time = (perception_state.timesteps % config["CONTROL_UPDATE_INTERVAL"] == 0)
 
-                # CONTROL (Leader) UPDATE with convergence loop - sample new batch each step
+                # CONTROL (Leader)
                 def control_step(carry, _):
                     control_state_inner, rng_inner = carry
                     rng_inner, rng_sample = jax.random.split(rng_inner)
@@ -361,7 +355,6 @@ def make_train(config):
                             perception_state.params, learning_obs[:, :-1], burn_in_hidden
                         )
 
-                        # CRITICAL: Stop gradients from flowing to perception network
                         representations = jax.lax.stop_gradient(representations)
 
                         # Get Q-values from control network
@@ -372,7 +365,6 @@ def make_train(config):
                             axis=-1
                         ).squeeze(axis=-1)
 
-                        # Compute targets using Double Q-learning
                         representations_next, _ = perception_network.apply(
                             perception_state.target_params, learning_obs, burn_in_hidden
                         )
@@ -388,7 +380,6 @@ def make_train(config):
                             axis=-1
                         ).squeeze(axis=-1)
 
-                        # Compute n-step TD targets using rlax
                         discounts = jnp.where(
                             learning_truncated,
                             config["GAMMA"],
@@ -422,7 +413,6 @@ def make_train(config):
                         importance = importance ** beta
                         importance = importance / jnp.max(importance)
 
-                        # Weighted loss
                         loss = jnp.mean(importance[:, None] * jnp.square(td_error))
 
                         # Calculate priorities
@@ -462,14 +452,12 @@ def make_train(config):
                     lambda: skip_control_updates()
                 )
 
-                # Extract the last values from convergence (scan always adds a leading axis)
                 if config["CONTROL_CONVERGENCE_STEPS"] > 1:
                     control_loss = control_losses[-1]
                     priorities = priorities_list[-1]
                     targets = targets_list[-1]
                     indices = indices_list[-1]
                 else:
-                    # For single step, squeeze the unnecessary leading dimension
                     control_loss = jnp.squeeze(control_losses)
                     priorities = jnp.squeeze(priorities_list, axis=0)
                     targets = jnp.squeeze(targets_list, axis=0)
@@ -477,14 +465,13 @@ def make_train(config):
 
                 perception_state = perception_state.replace(n_updates=perception_state.n_updates + 1)
 
-                # Update priorities in buffer only if control network was updated
                 buffer_state = jax.lax.cond(
                     is_control_update_time,
                     lambda: buffer.set_priorities(buffer_state, indices, priorities),
                     lambda: buffer_state
                 )
 
-                # PERCEPTION (Follower) UPDATE - Sample new batch for perception
+                # PERCEPTION UPDATE - Sample new batch for perception
                 rng, rng_leader = jax.random.split(rng)
                 leader_sample = buffer.sample(buffer_state, rng_leader)
                 leader_batch = leader_sample.experience
@@ -500,9 +487,8 @@ def make_train(config):
                 def process_burn_in_with_resets(params, obs_seq, done_seq, initial_hidden):
                     def scan_fn(hidden, inputs):
                         obs, done = inputs
-                        # Pass single observation with batch dim
                         _, new_hidden = perception_network.apply(params, obs[None, :], hidden[None, :])
-                        new_hidden = new_hidden[0]  # Remove batch dim
+                        new_hidden = new_hidden[0]
                         # Reset hidden state if done
                         hidden = jax.lax.cond(
                             done,
@@ -514,7 +500,7 @@ def make_train(config):
                     final_hidden, _ = jax.lax.scan(scan_fn, initial_hidden, (obs_seq, done_seq))
                     return final_hidden
 
-                # Burn-in for leader using perception network
+                # Burn-in using perception network
                 leader_burn_in_hidden = jax.vmap(process_burn_in_with_resets, in_axes=(None, 0, 0, 0))(
                     perception_state.params, leader_burn_in_obs, leader_burn_in_dones, leader_initial_hiddens
                 )
@@ -532,7 +518,7 @@ def make_train(config):
                         perception_params, leader_learning_obs[:, :-1], leader_burn_in_hidden
                     )
 
-                    # CRITICAL: Use FIXED control network parameters (true Stackelberg)
+                    # Using fixed control network parameters (true Stackelberg)
                     q_vals = control_network.apply(
                         jax.lax.stop_gradient(control_state.params),
                         representations
@@ -559,7 +545,6 @@ def make_train(config):
                         axis=-1
                     ).squeeze(axis=-1)
 
-                    # Compute n-step TD targets using rlax
                     discounts = jnp.where(
                         leader_learning_truncated,
                         config["GAMMA"],
@@ -585,27 +570,20 @@ def make_train(config):
                     # Calculate loss components
                     msbe = jnp.mean(jnp.square(td_errors))
                     td_mean = jnp.mean(td_errors)
-                    td_variance = jnp.mean(jnp.square(td_errors - td_mean))
-                    representation_norm = jnp.mean(jnp.square(representations))
-                    target_norm = 1.0
-                    norm_loss = config["COEF_REPRESENTATION_NORM"] * jnp.square(target_norm - representation_norm)
+                    be_variance = jnp.mean(jnp.square(td_errors - td_mean))
 
                     # Combine loss components based on config
-                    loss = msbe * (1.0 - config["USE_TD_VARIANCE"]) * (1.0 - config["USE_NORM_LOSS"])
+                    loss = msbe * (1.0 - config["USE_VARIANCE_LOSS"])
 
-                    if config["USE_TD_VARIANCE"]:
-                        loss = loss + td_variance
+                    if config["USE_VARIANCE_LOSS"]:
+                        loss = loss + be_variance
 
-                    if config["USE_NORM_LOSS"]:
-                        loss = loss + norm_loss
 
                     return loss, {
-                        "td_variance": td_variance,
-                        "representation_norm": representation_norm,
+                        "be_variance": be_variance,
                         "msbe": msbe
                     }
 
-                # Conditionally update perception (follower) - using timesteps like other SCORER implementations
                 is_perception_update_time = (perception_state.timesteps % config["PERCEPTION_UPDATE_INTERVAL"] == 0)
 
                 def update_perception():
@@ -634,8 +612,7 @@ def make_train(config):
             )
 
             empty_perception_metrics = {
-                "td_variance": jnp.array(0.0),
-                "representation_norm": jnp.array(0.0),
+                "be_variance": jnp.array(0.0),
                 "msbe": jnp.array(0.0)
             }
 
@@ -677,8 +654,7 @@ def make_train(config):
                 "updates": perception_state.n_updates,
                 "control_loss": control_loss.mean(),
                 "perception_loss": perception_metrics.get("msbe", 0.0),
-                "td_variance": perception_metrics.get("td_variance", 0.0),
-                "representation_norm": perception_metrics.get("representation_norm", 0.0),
+                "be_variance": perception_metrics.get("be_variance", 0.0),
                 "returns": info["returned_episode_returns"].mean(),
             }
 
@@ -726,10 +702,8 @@ def run_single_seed(config, seed):
     loss_components = []
     if config["USE_MSBE"]:
         loss_components.append("MSBE")
-    if config["USE_TD_VARIANCE"]:
-        loss_components.append("TDVar")
-    if config["USE_NORM_LOSS"]:
-        loss_components.append("Norm")
+    if config["USE_VARIANCE_LOSS"]:
+        loss_components.append("BEVar")
     loss_str = '+'.join(loss_components) if loss_components else "MSBE"
 
     filename_prefix = f"SCORER_R2D2_{config['ENV_NAME']}_{loss_str}_{seed}"
@@ -770,10 +744,9 @@ def process_results(config, outs, seed_values):
     loss_components = []
     if config["USE_MSBE"]:
         loss_components.append("MSBE")
-    if config["USE_TD_VARIANCE"]:
-        loss_components.append("TDVar")
-    if config["USE_NORM_LOSS"]:
-        loss_components.append("Norm")
+    if config["USE_VARIANCE_LOSS"]:
+        loss_components.append("BEVar")
+
     loss_str = '+'.join(loss_components) if loss_components else "MSBE"
 
     filename_prefix = f"SCORER_R2D2/{config['ENV_NAME']}_{loss_str}_{config['SEED']}"
@@ -821,7 +794,7 @@ config = {
     "TARGET_UPDATE_INTERVAL": 5_000,
     "LR": 1e-4,
     "LEARNING_STARTS": 25_000,
-    "CONTROL_UPDATE_INTERVAL": 16,  # Control (leader) updates less frequently
+    "CONTROL_UPDATE_INTERVAL": 16,
     "LR_LINEAR_DECAY": True,
     "GAMMA": 0.99,
     "TAU": 1.0,
@@ -830,11 +803,9 @@ config = {
     "PERCEPTION_LR": 3e-4,  # Perception (follower) has higher learning rate
     "PERCEPTION_UPDATE_INTERVAL": 16,
     "PERCEPTION_MAX_GRAD_NORM": 0.5,
-    "CONTROL_CONVERGENCE_STEPS": args.control_convergence_steps,
-    "USE_MSBE": not (args.use_td_variance or args.use_norm_loss),
-    "USE_TD_VARIANCE": args.use_td_variance,
-    "USE_NORM_LOSS": args.use_norm_loss,
-    "COEF_REPRESENTATION_NORM": args.coef_representation_norm,
+    "CONTROL_CONVERGENCE_STEPS": args.control_convergence_steps, # following TTSA we stick to 1 step
+    "USE_MSBE": not (args.use_be_variance),
+    "USE_VARIANCE_LOSS": args.use_be_variance,
 
     # PER parameters
     "PER_ALPHA": 0.6,
