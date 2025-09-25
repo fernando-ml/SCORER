@@ -18,5 +18,5 @@ The project will automatically use Python 3.10 as specified in the `.python-vers
 Use `uv run` to execute scripts, for example:
 
 ```bash
-uv run DDQN_SCORER.py --env SpaceInvaders-MinAtar --total_timesteps 1e8 --use_td_variance --seed 10 --num_seeds 30
+uv run DDQN_SCORER.py --env SpaceInvaders-MinAtar --total_timesteps 1e8 --use_be_variance --seed 10 --num_seeds 30
 ```
